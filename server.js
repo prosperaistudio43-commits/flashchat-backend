@@ -5,7 +5,6 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 
-// Enable CORS so your Netlify frontend can talk to this backend safely
 const io = new Server(server, {
     cors: {
         origin: "*", 
@@ -13,51 +12,57 @@ const io = new Server(server, {
     }
 });
 
-const activeUsers = new Map(); // Tracks socket connections and tags
-const activeChats = new Map(); // Tracks rooms and message history
+const activeUsers = new Map(); // Tracks socket.id -> { number, username, joinedAt }
+const activeChats = new Map(); // Tracks rooms -> { messages, createdAt }
 
-// Generate a random unique 4-digit numeric tag
-function generateUniqueTag() {
-    let tag;
-    const existingTags = Array.from(activeUsers.values()).map(u => u.tag);
+function generateUniqueNumber() {
+    let num;
+    const existingNumbers = Array.from(activeUsers.values()).map(u => u.number);
     do {
-        tag = Math.floor(1000 + Math.random() * 9000).toString();
-    } while (existingTags.includes(tag));
-    return tag;
+        num = Math.floor(1000 + Math.random() * 9000).toString();
+    } while (existingNumbers.includes(num));
+    return num;
 }
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // Assign unique tag immediately on connection
-    const userTag = generateUniqueTag();
-    activeUsers.set(socket.id, { tag: userTag, joinedAt: Date.now() });
-    socket.emit('assigned_tag', { tag: userTag });
+    // Register user with a username
+    socket.on('register_user', ({ username }) => {
+        const userNumber = generateUniqueNumber();
+        activeUsers.set(socket.id, { number: userNumber, username: username, joinedAt: Date.now() });
+        
+        // Send registration details back to client
+        socket.emit('assigned_credentials', { number: userNumber, username });
+    });
 
-    // Handle peer-to-peer pairing request
-    socket.on('connect_to_peer', ({ peerTag }) => {
-        const peerSocketEntry = Array.from(activeUsers.entries())
-            .find(([_, data]) => data.tag === peerTag);
+    // Handle pairing request via unique Number
+    socket.on('connect_to_peer', ({ peerNumber }) => {
+        const currentUser = activeUsers.get(socket.id);
+        if (!currentUser) return;
 
-        if (!peerSocketEntry) {
-            socket.emit('error_message', { message: 'Tag not found or user has disconnected.' });
+        const peerEntry = Array.from(activeUsers.entries())
+            .find(([_, data]) => data.number === peerNumber);
+
+        if (!peerEntry) {
+            socket.emit('error_message', { message: 'Number not found or user offline.' });
             return;
         }
 
-        const peerSocketId = peerSocketEntry[0];
-        const roomName = [userTag, peerTag].sort().join('_');
+        const peerSocketId = peerEntry[0];
+        const peerData = peerEntry[1];
+        
+        // Unique room identifier sorted by their unique numbers
+        const roomName = [currentUser.number, peerData.number].sort().join('_');
         const targetSocket = io.sockets.sockets.get(peerSocketId);
         
         if (targetSocket) {
-            // Force BOTH sockets to enter the room channel immediately
             socket.join(roomName); 
             targetSocket.join(roomName); 
 
-            // Alert each user specifically with their peer's tag
-            socket.emit('peer_connected', { roomName, peerTag: peerTag });
-            targetSocket.emit('peer_connected', { roomName, peerTag: userTag });
-        } else {
-            socket.emit('error_message', { message: 'Failed to establish secure room tunnel.' });
+            // Exchange structural metadata profiles
+            socket.emit('peer_connected', { roomName, peerNumber: peerData.number, peerUsername: peerData.username });
+            targetSocket.emit('peer_connected', { roomName, peerNumber: currentUser.number, peerUsername: currentUser.username });
         }
 
         if (!activeChats.has(roomName)) {
@@ -65,46 +70,36 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Handle incoming real-time messages
     socket.on('send_message', ({ roomName, message }) => {
-        const chat = activeChats.get(roomName);
-        if (chat) {
-            // ✅ FIX: Include the exact roomName in the message object
+        const currentUser = activeUsers.get(socket.id);
+        if (currentUser && activeChats.has(roomName)) {
             const msgData = { 
                 roomName: roomName, 
-                sender: userTag, 
+                sender: currentUser.number, 
                 text: message, 
                 timestamp: Date.now() 
             };
-            chat.messages.push(msgData);
-            
-            // Broadcast message back to the active room channel
+            activeChats.get(roomName).messages.push(msgData);
             io.to(roomName).emit('receive_message', msgData);
         }
     });
 
-    // Clean up connections when user leaves or refreshes tabs
     socket.on('disconnect', () => {
-        console.log(`User disconnected: ${socket.id}`);
         activeUsers.delete(socket.id);
     });
-}); // <--- THIS WAS THE MISSING CLOSING PROPERTY CAUSING THE CRASH!
+});
 
-// --- THE 30-MINUTE SELF-DESTRUCT MECHANISM ---
+// 30-Minute Expiration Core Loop
 setInterval(() => {
     const now = Date.now();
     const THIRTY_MINUTES = 30 * 60 * 1000;
-
     for (const [roomName, chatData] of activeChats.entries()) {
         if (now - chatData.createdAt > THIRTY_MINUTES) {
-            console.log(`⏱️ Wiping expired chat room: ${roomName}`);
-            io.to(roomName).emit('chat_expired', { message: 'This chat session has expired after 30 minutes.' });
+            io.to(roomName).emit('chat_expired', { message: 'This ephemeral session has expired.' });
             activeChats.delete(roomName);
         }
     }
-}, 60000); // Runs once every minute
+}, 60000);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Server listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Engine live on port ${PORT}`));
