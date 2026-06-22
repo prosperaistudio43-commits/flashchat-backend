@@ -33,30 +33,34 @@ io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
     // Registration handler
-// Ensure these bindings are added inside your io.on("connection", (socket) => { ... }) context block
+    socket.on('register_user', ({ username }) => {
+        const userNumber = generate10DigitNumber();
+        activeUsers.set(socket.id, { number: userNumber, username });
+        socket.emit('assigned_credentials', { number: userNumber, username });
+    });
 
-// 1. Initial 10-Digit PROFILE GENERATION
-socket.on('register_user', ({ username }) => {
-    // Generate secure 10-digit numeric routing string (NOMBER profile)
-    const generatedNumber = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-    socket.join(generatedNumber);
-    socket.emit('assigned_credentials', { number: generatedNumber, username });
-});
+    // Revisit profile recovery handler
+    socket.on('restore_profile', ({ number, username }) => {
+        const oldSocketId = getSocketIdByNumber(number);
+        if (oldSocketId && oldSocketId !== socket.id) {
+            activeUsers.delete(oldSocketId);
+        }
+        activeUsers.set(socket.id, { number, username });
+        socket.emit('profile_restored_confirm', { number, username });
+    });
 
-// 2. SETTINGS ACCOUNT UPDATE PROFILE HOOK
-socket.on('update_profile', ({ newUsername }) => {
-    socket.emit('profile_updated_confirm', { username: newUsername });
-});
+    socket.on('update_profile', ({ newUsername }) => {
+        const user = activeUsers.get(socket.id);
+        if (user) {
+            user.username = newUsername;
+            socket.emit('profile_updated_confirm', { username: newUsername });
+        }
+    });
 
-// 3. SECURE RE-AUTH HANDLER
-socket.on('restore_profile', ({ number, username }) => {
-    socket.join(number);
-});
-
-// 4. DESTRUCTIVE REMOVAL LIFECYCLE
-socket.on('delete_profile_data', () => {
-    socket.emit('profile_deleted_confirm');
-});
+    socket.on('delete_profile_data', () => {
+        activeUsers.delete(socket.id);
+        socket.emit('profile_deleted_confirm');
+    });
     socket.on('connect_to_peer', ({ peerNumber }) => {
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) return;
