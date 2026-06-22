@@ -6,22 +6,19 @@ const app = express();
 const server = http.createServer(app);
 
 // 1. FIXED CORS DOMAIN POLICY
-// Whitelist allows production domain (without a trailing slash) and common local environments
 const ALLOWED_ORIGINS = [
-    "https://strong-crepe-37984f.netlify.app", // Fixed: Removed trailing slash to match actual browser header
+    "https://strong-crepe-37984f.netlify.app", // Clean production link matching browser headers
     "http://localhost:5500",                   // Local Live Server frontend mapping
     "http://127.0.0.1:5500",                   // Alternate local standard IP mapping
-    "http://localhost:3000",                   // Catch-all for alternate frontend frameworks
+    "http://localhost:3000",                   // Catch-all for alternate local frameworks
     "http://127.0.0.1:3000"
 ];
 
 const io = new Server(server, {
     cors: {
         origin: (origin, callback) => {
-            // Allow tools with no browser origin payload (like internal server pings or status checks)
             if (!origin) return callback(null, true);
             
-            // Dynamic check matching strict whitelist or standard development server ports
             const isAllowed = ALLOWED_ORIGINS.includes(origin) || 
                               origin.startsWith("http://localhost:") || 
                               origin.startsWith("http://127.0.0.1:");
@@ -56,7 +53,7 @@ function generate10DigitNumber() {
 }
 
 io.on('connection', (socket) => {
-    // 2. FIXED SECONDARY HANDSHAKE FAIL-SAFE CHECK
+    // 2. HANDSHAKE FAIL-SAFE CHECK
     const clientOrigin = socket.handshake.headers.origin;
     if (clientOrigin) {
         const isAllowed = ALLOWED_ORIGINS.includes(clientOrigin) || 
@@ -78,8 +75,6 @@ io.on('connection', (socket) => {
 
     socket.use(([event, ...args], next) => {
         const now = Date.now();
-        
-        // Reset rolling metrics frame window every 10 seconds
         if (now - socket.lastResetTime > 10000) {
             socket.actionCount = 0;
             socket.lastResetTime = now;
@@ -87,7 +82,6 @@ io.on('connection', (socket) => {
 
         socket.actionCount++;
 
-        // Strict Limit Rule: Automatically drops sockets emitting too fast
         if (socket.actionCount > 25) {
             console.warn(`🚨 Rate limit exceeded by socket: ${socket.id}. Forced disconnect executed.`);
             socket.emit('error_message', { message: 'Rate limit exceeded. Connection throttled.' });
@@ -97,7 +91,7 @@ io.on('connection', (socket) => {
         next();
     });
 
-    // Registration handler
+    // Registration handler (Only path where a new NOMBER is ever generated)
     socket.on('register_user', ({ username }) => {
         if (!username || username.trim().length === 0) return;
         
@@ -111,20 +105,34 @@ io.on('connection', (socket) => {
         if (!number || !username) return;
 
         const oldSocketId = getSocketIdByNumber(number);
+        // If they are logging in on a new socket tab, wipe the stale mapping link
         if (oldSocketId && oldSocketId !== socket.id) {
             activeUsers.delete(oldSocketId);
         }
-        activeUsers.set(socket.id, { number, username });
-        socket.emit('profile_restored_confirm', { number, username });
+        
+        // Save state cleanly bound strictly to the current active socket id
+        activeUsers.set(socket.id, { number: number.toString(), username: username.trim() });
+        socket.emit('profile_restored_confirm', { number: number.toString(), username: username.trim() });
     });
 
+    // FIXED PROFILE UPDATE HANDLER (Explicitly preserves existing NOMBER tracking string)
     socket.on('update_profile', ({ newUsername }) => {
         if (!newUsername || newUsername.trim().length === 0) return;
 
-        const user = activeUsers.get(socket.id);
-        if (user) {
-            user.username = newUsername.trim();
-            socket.emit('profile_updated_confirm', { username: newUsername.trim() });
+        const currentUser = activeUsers.get(socket.id);
+        if (currentUser) {
+            // Keep the exact original persistent number, only alter the display name payload property
+            const preservedNumber = currentUser.number;
+            currentUser.username = newUsername.trim();
+
+            // Explicitly force state mapping confirmation down pipeline
+            socket.emit('profile_updated_confirm', { 
+                number: preservedNumber, 
+                username: currentUser.username 
+            });
+        } else {
+            // If socket lost state in memory, tell client to reauth without breaking variables
+            socket.emit('request_reauth');
         }
     });
 
@@ -153,7 +161,6 @@ io.on('connection', (socket) => {
         io.to(peerSocketId).emit('peer_connected', { roomName, peerNumber: currentUser.number, peerUsername: currentUser.username, initiator: false });
     });
 
-    // 4. ROBUST SECURED MESSAGING LINE VALIDATION
     socket.on('send_message', ({ roomName, message }) => {
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) {
@@ -163,7 +170,6 @@ io.on('connection', (socket) => {
 
         if (!message || message.trim().length === 0 || !roomName) return;
 
-        // Security Validation Check: Parse the room identity to ensure the sender is part of it
         const verifiedPeers = roomName.split('_');
         if (!verifiedPeers.includes(currentUser.number)) {
             socket.emit('error_message', { message: 'Unauthorized pipeline. Access denied to target channel room.' });
