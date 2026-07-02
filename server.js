@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 
+// Enable Cross-Origin Resource Sharing for all origins
 const io = new Server(server, {
     cors: {
         origin: "*", 
@@ -12,125 +13,109 @@ const io = new Server(server, {
     }
 });
 
-// Expose a quick HTTP endpoint to wake up / ping the server
+const activeUsers = new Map(); // socket.id -> { number, username }
+const activeChats = new Map(); // roomName -> { messages, createdAt }
+
+// ⚡ WAKE UP GATEWAY: Crucial for waking up Render's free tier immediately on frontend load
 app.get('/ping', (req, res) => {
     res.status(200).send('pong');
 });
 
-// Dual-mapping to handle dynamic WebSockets reliably
-const usersByNumber = new Map(); // number -> { username, socketId }
-const numberBySocket = new Map(); // socketId -> number
-const activeChats = new Map();    // roomName -> { messages, createdAt }
+// Helper utility to match an active 10-digit NOMBER profile with its active live socket instance
+function getSocketIdByNumber(number) {
+    const entry = Array.from(activeUsers.entries()).find(([_, data]) => data.number === number);
+    return entry ? entry[0] : null;
+}
 
+// Generates an isolated, non-colliding random 10-digit identifier string
 function generate10DigitNumber() {
     let num;
+    const existingNumbers = Array.from(activeUsers.values()).map(u => u.number);
     do {
         num = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-    } while (usersByNumber.has(num)); // Secure check against persistent store
+    } while (existingNumbers.includes(num));
     return num;
 }
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // Registration handler
+    // Registration Handler: Triggered when user clicks "Generate NOMBER Profile"
     socket.on('register_user', ({ username }) => {
         if (!username || username.trim() === "") {
-            return socket.emit('error_message', { message: "Invalid username input." });
+            return socket.emit('error_message', { message: "Username cannot be empty." });
         }
         
         const userNumber = generate10DigitNumber();
+        activeUsers.set(socket.id, { number: userNumber, username: username.trim() });
         
-        // Save bindings
-        usersByNumber.set(userNumber, { username: username.trim(), socketId: socket.id });
-        numberBySocket.set(socket.id, userNumber);
-
-        socket.emit('profile_generated', { 
-            number: userNumber, 
-            username: username.trim() 
-        });
+        // Emits 'assigned_credentials' to match the frontend app.js event targets perfectly
+        socket.emit('assigned_credentials', { number: userNumber, username: username.trim() });
     });
 
-    // Persistent Check Auth / Session Recovery
-    socket.on('check_auth', ({ number, username }) => {
-        if (!number || !username) {
-            return socket.emit('auth_failed');
+    // Session Recovery Hook: Re-binds identity parameters cleanly when client refreshes or changes network lines
+    socket.on('restore_profile', ({ number, username }) => {
+        if (!number || !username) return;
+
+        // Garbage collection: If this profile number is still tied to a dead socket, drop it first
+        const oldSocketId = getSocketIdByNumber(number);
+        if (oldSocketId && oldSocketId !== socket.id) {
+            activeUsers.delete(oldSocketId);
         }
-
-        // Re-bind the new socket ID to the persistent identity
-        usersByNumber.set(number, { username: username, socketId: socket.id });
-        numberBySocket.set(socket.id, number);
-
-        socket.emit('auth_verified', { number, username });
-
-        // Auto-restore room subscriptions for this new socket
-        for (const roomName of activeChats.keys()) {
-            if (roomName.includes(number)) {
-                socket.join(roomName);
-            }
-        }
+        
+        activeUsers.set(socket.id, { number, username: username.trim() });
+        socket.emit('assigned_credentials', { number, username: username.trim() });
     });
 
-    // Profile updates keep the numeric ID persistent
+    // Profile Customization Hook: Updates username while preserving the persistent numeric ID
     socket.on('update_profile', ({ newUsername }) => {
-        const userNumber = numberBySocket.get(socket.id);
-        if (!userNumber || !newUsername) return;
-
-        usersByNumber.set(userNumber, { username: newUsername.trim(), socketId: socket.id });
-        socket.emit('profile_updated_confirm', { username: newUsername.trim() });
+        const user = activeUsers.get(socket.id);
+        if (user && newUsername && newUsername.trim() !== "") {
+            user.username = newUsername.trim();
+            socket.emit('profile_updated_confirm', { username: user.username });
+        }
     });
 
-    // Clean up profile data explicitly
+    // Explicit Deletion Hook: Completely unbinds records from server state
     socket.on('delete_profile_data', () => {
-        const userNumber = numberBySocket.get(socket.id);
-        if (userNumber) {
-            usersByNumber.delete(userNumber);
-        }
-        numberBySocket.delete(socket.id);
+        activeUsers.delete(socket.id);
         socket.emit('profile_deleted_confirm');
     });
 
-    // Connection matching handler
-    socket.on('connect_peer', ({ peerNumber }) => {
-        const myNumber = numberBySocket.get(socket.id);
-        if (!myNumber) {
-            return socket.emit('error_message', { message: "Session expired. Reauthenticating..." });
+    // Peer Line Sync Handler: Subscribes both independent channels to an isolated room
+    socket.on('connect_to_peer', ({ peerNumber }) => {
+        const currentUser = activeUsers.get(socket.id);
+        if (!currentUser) return;
+
+        const peerSocketId = getSocketIdByNumber(peerNumber);
+        if (!peerSocketId) {
+            socket.emit('error_message', { message: 'The requested NOMBER is currently offline or invalid.' });
+            return;
         }
 
-        const peerData = usersByNumber.get(peerNumber);
-        if (!peerData) {
-            return socket.emit('error_message', { message: "Target profile number could not be found." });
-        }
-
-        const currentUser = usersByNumber.get(myNumber);
-        const roomName = [myNumber, peerNumber].sort().join('-');
+        const peerData = activeUsers.get(peerSocketId);
+        // Create an ordered, standardized room format (e.g. "1234567890_0987654321")
+        const roomName = [currentUser.number, peerData.number].sort().join('_');
 
         socket.join(roomName);
-        
-        // Get peer's active socket connection
-        const peerSocketId = peerData.socketId;
-        const peerSocket = io.sockets.sockets.get(peerSocketId);
-        
-        if (peerSocket) {
-            peerSocket.join(roomName);
-        }
+        io.sockets.sockets.get(peerSocketId)?.join(roomName);
 
-        // Sync old chat logs if room history exists
-        const structuralHistory = activeChats.has(roomName) ? activeChats.get(roomName).messages : [];
-        
-        socket.emit('peer_connected', { roomName, peerNumber, peerUsername: peerData.username, initiator: true, history: structuralHistory });
-        io.to(peerSocketId).emit('peer_connected', { roomName, peerNumber: myNumber, peerUsername: currentUser.username, initiator: false, history: structuralHistory });
+        // Echo responses back to build localized state profiles on the frontend layout
+        socket.emit('peer_connected', { roomName, peerNumber: peerData.number, peerUsername: peerData.username, initiator: true });
+        io.to(peerSocketId).emit('peer_connected', { roomName, peerNumber: currentUser.number, peerUsername: currentUser.username, initiator: false });
     });
 
+    // Message Broadcasting Engine
     socket.on('send_message', ({ roomName, message }) => {
-        const userNumber = numberBySocket.get(socket.id);
-        if (!userNumber) {
-            return socket.emit('request_reauth');
+        const currentUser = activeUsers.get(socket.id);
+        if (!currentUser) {
+            socket.emit('request_reauth');
+            return;
         }
 
         const msgData = {
             roomName,
-            sender: userNumber,
+            sender: currentUser.number,
             text: message,
             timestamp: Date.now()
         };
@@ -139,39 +124,30 @@ io.on('connection', (socket) => {
             activeChats.set(roomName, { messages: [], createdAt: Date.now() });
         }
         activeChats.get(roomName).messages.push(msgData);
+        
+        // Deliver message structure instantly to everyone currently listening inside the room
         io.to(roomName).emit('receive_message', msgData);
     });
 
-    // Garbage collection on connection loss
+    // ⚡ FIXED GARBAGE COLLECTION: Removes the transient map hook immediately on connection drop
     socket.on('disconnect', () => {
         console.log(`User disconnected: ${socket.id}`);
-        const userNumber = numberBySocket.get(socket.id);
-        
-        // Remove transient socket mapping, keep persistent user registry intact
-        if (userNumber) {
-            const userData = usersByNumber.get(userNumber);
-            if (userData && userData.socketId === socket.id) {
-                // Set socketId to null indicating they are offline but registered
-                userData.socketId = null; 
-            }
-        }
-        numberBySocket.delete(socket.id);
+        activeUsers.delete(socket.id);
     });
 });
 
-// Periodic Sweeper Routine (Stops memory leaks)
+// Ephemeral Sweeper Engine: Tracks room expiration intervals to delete historical message payloads
 setInterval(() => {
     const now = Date.now();
     const THIRTY_MINUTES = 30 * 60 * 1000;
+    
     for (const [roomName, chatData] of activeChats.entries()) {
         if (now - chatData.createdAt > THIRTY_MINUTES) {
-            io.to(roomName).emit('room_expired');
+            io.to(roomName).emit('chat_expired', { message: 'This ephemeral conversation has expired.' });
             activeChats.delete(roomName);
         }
     }
-}, 60000);
+}, 60000); // Evaluates state conditions every 60 seconds
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`⚡ Backend Core running smoothly on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 FlashChat Backend Engine live on port ${PORT}`));
