@@ -26,14 +26,12 @@ function getSocketIdByNumber(number) {
     return entry ? entry[0] : null;
 }
 
-// ⚡ UPDATED: Generates an isolated tag format starting explicitly with '+034' followed by 7 random digits
-function generateCustomPrefixNumber() {
+// ⚡ RESTORED ENGINE: Generates a clean random 10-digit numeric string profile identification tag
+function generate10DigitNumber() {
     let identificationTag;
     const existingNumbers = Array.from(activeUsers.values()).map(u => u.number);
     do {
-        // Generates 7 random digits between 1000000 and 9999999
-        const randomSevenDigits = Math.floor(1000000 + Math.random() * 9000000).toString();
-        identificationTag = `+034${randomSevenDigits}`;
+        identificationTag = Math.floor(1000000000 + Math.random() * 9000000000).toString();
     } while (existingNumbers.includes(identificationTag));
     return identificationTag;
 }
@@ -47,7 +45,7 @@ io.on('connection', (socket) => {
             return socket.emit('error_message', { message: "Username cannot be empty." });
         }
         
-        const userNumber = generateCustomPrefixNumber();
+        const userNumber = generate10DigitNumber();
         activeUsers.set(socket.id, { number: userNumber, username: username.trim() });
         socket.emit('assigned_credentials', { number: userNumber, username: username.trim() });
     });
