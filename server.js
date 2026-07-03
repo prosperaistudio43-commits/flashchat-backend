@@ -15,25 +15,27 @@ const io = new Server(server, {
 const activeUsers = new Map(); // socket.id -> { number, username }
 const activeChats = new Map(); // roomName -> { messages, createdAt }
 
-// ⚡ WAKE UP GATEWAY: Wakes up Render container instances immediately on frontend DOM load
+// WAKE UP GATEWAY
 app.get('/ping', (req, res) => {
     res.status(200).send('pong');
 });
 
-// Helper utility to match an active 10-digit NOMBER profile with its active live socket instance
+// Helper utility to match a tag identity string with its live active socket instance
 function getSocketIdByNumber(number) {
     const entry = Array.from(activeUsers.entries()).find(([_, data]) => data.number === number);
     return entry ? entry[0] : null;
 }
 
-// Generates an isolated, non-colliding random 10-digit identifier string
-function generate10DigitNumber() {
-    let num;
+// ⚡ UPDATED: Generates an isolated tag format starting explicitly with '+034' followed by 7 random digits
+function generateCustomPrefixNumber() {
+    let identificationTag;
     const existingNumbers = Array.from(activeUsers.values()).map(u => u.number);
     do {
-        num = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-    } while (existingNumbers.includes(num));
-    return num;
+        // Generates 7 random digits between 1000000 and 9999999
+        const randomSevenDigits = Math.floor(1000000 + Math.random() * 9000000).toString();
+        identificationTag = `+034${randomSevenDigits}`;
+    } while (existingNumbers.includes(identificationTag));
+    return identificationTag;
 }
 
 io.on('connection', (socket) => {
@@ -45,7 +47,7 @@ io.on('connection', (socket) => {
             return socket.emit('error_message', { message: "Username cannot be empty." });
         }
         
-        const userNumber = generate10DigitNumber();
+        const userNumber = generateCustomPrefixNumber();
         activeUsers.set(socket.id, { number: userNumber, username: username.trim() });
         socket.emit('assigned_credentials', { number: userNumber, username: username.trim() });
     });
@@ -72,22 +74,19 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ❌ UPDATED DELETION HOOK: Scans active communication lines to tell peers this identity was destroyed
+    // Deletion Hook
     socket.on('delete_profile_data', () => {
         const currentUser = activeUsers.get(socket.id);
         
         if (currentUser) {
             const userNumber = currentUser.number;
             
-            // Search active structures for dependencies containing this user's private tag
             for (const roomName of activeChats.keys()) {
                 if (roomName.includes(userNumber)) {
-                    // Send alert to the room before dropping tracking reference parameters
                     io.to(roomName).emit('peer_profile_deleted', {
                         roomName,
-                        message: `System Alert: ${currentUser.username} has permanently closed their account.`
+                        message: `System Alert: Profile connection closed.`
                     });
-                    
                     activeChats.delete(roomName);
                 }
             }
@@ -104,7 +103,7 @@ io.on('connection', (socket) => {
 
         const peerSocketId = getSocketIdByNumber(peerNumber);
         if (!peerSocketId) {
-            socket.emit('error_message', { message: 'The requested NOMBER is currently offline or invalid.' });
+            socket.emit('error_message', { message: 'The requested line profile is offline or invalid.' });
             return;
         }
 
