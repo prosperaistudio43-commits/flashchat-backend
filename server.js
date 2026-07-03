@@ -32,18 +32,6 @@ function addUserRoom(number, roomName) {
     userRooms.get(number).add(roomName);
 }
 
-function broadcastPresenceToPeers(number, status) {
-    const rooms = userRooms.get(number);
-    if (!rooms) return;
-    rooms.forEach(roomName => {
-        const peerNumber = getPeerNumberInRoom(roomName, number);
-        const peerSocketId = getSocketIdByNumber(peerNumber);
-        if (peerSocketId) {
-            io.to(peerSocketId).emit('peer_presence', { peerNumber: number, status });
-        }
-    });
-}
-
 function generate10DigitNumber() {
     let num;
     const existingNumbers = Array.from(activeUsers.values()).map(u => u.number);
@@ -82,7 +70,6 @@ io.on('connection', (socket) => {
         }
 
         socket.emit('profile_restored_confirm', { number, username });
-        broadcastPresenceToPeers(number, 'online');
     });
 
     socket.on('update_profile', ({ newUsername }) => {
@@ -135,13 +122,6 @@ io.on('connection', (socket) => {
         io.to(peerSocketId).emit('peer_connected', { roomName, peerNumber: currentUser.number, peerUsername: currentUser.username, initiator: false });
     });
 
-    // ⚡ Presence: relay this user's online/away status to whoever shares a room with them.
-    socket.on('presence_update', ({ status }) => {
-        const user = activeUsers.get(socket.id);
-        if (!user) return;
-        broadcastPresenceToPeers(user.number, status);
-    });
-
     // Best-effort room cleanup when a user deletes a chat on their end.
     socket.on('leave_room', ({ roomName }) => {
         const user = activeUsers.get(socket.id);
@@ -174,10 +154,6 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         console.log(`User disconnected: ${socket.id}`);
-        const user = activeUsers.get(socket.id);
-        if (user) {
-            broadcastPresenceToPeers(user.number, 'offline');
-        }
     });
 });
 
