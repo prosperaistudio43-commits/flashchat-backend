@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
-const app = reportExpressStatus = express();
+const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -14,76 +14,101 @@ const io = new Server(server, {
 
 const activeUsers = new Map(); // socket.id -> { number, username }
 const activeChats = new Map(); // roomName -> { messages, createdAt }
-
-app.get('/ping', (req, res) => {
-    res.status(200).send('pong');
-});
+const userRooms = new Map();   // number -> Set of roomNames this user belongs to
 
 function getSocketIdByNumber(number) {
     const entry = Array.from(activeUsers.entries()).find(([_, data]) => data.number === number);
     return entry ? entry[0] : null;
 }
 
+// Room names are deterministically "<lowerNumber>_<higherNumber>" (see connect_to_peer),
+// so the other participant's number can always be derived from the room name itself.
+function getPeerNumberInRoom(roomName, myNumber) {
+    return roomName.split('_').find(n => n !== myNumber);
+}
+
+function addUserRoom(number, roomName) {
+    if (!userRooms.has(number)) userRooms.set(number, new Set());
+    userRooms.get(number).add(roomName);
+}
+
+function broadcastPresenceToPeers(number, status) {
+    const rooms = userRooms.get(number);
+    if (!rooms) return;
+    rooms.forEach(roomName => {
+        const peerNumber = getPeerNumberInRoom(roomName, number);
+        const peerSocketId = getSocketIdByNumber(peerNumber);
+        if (peerSocketId) {
+            io.to(peerSocketId).emit('peer_presence', { peerNumber: number, status });
+        }
+    });
+}
+
 function generate10DigitNumber() {
-    let identificationTag;
+    let num;
     const existingNumbers = Array.from(activeUsers.values()).map(u => u.number);
     do {
-        identificationTag = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-    } while (existingNumbers.includes(identificationTag));
-    return identificationTag;
+        num = Math.floor(1000000000 + Math.random() * 9000000000).toString();
+    } while (existingNumbers.includes(num));
+    return num;
 }
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
+    // Registration handler
     socket.on('register_user', ({ username }) => {
-        if (!username || username.trim() === "") {
-            return socket.emit('error_message', { message: "Username cannot be empty." });
-        }
-        
         const userNumber = generate10DigitNumber();
-        activeUsers.set(socket.id, { number: userNumber, username: username.trim() });
-        socket.emit('assigned_credentials', { number: userNumber, username: username.trim() });
+        activeUsers.set(socket.id, { number: userNumber, username });
+        socket.emit('assigned_credentials', { number: userNumber, username });
     });
 
+    // Revisit profile recovery handler
     socket.on('restore_profile', ({ number, username }) => {
-        if (!number || !username) return;
-
         const oldSocketId = getSocketIdByNumber(number);
         if (oldSocketId && oldSocketId !== socket.id) {
             activeUsers.delete(oldSocketId);
         }
-        
-        activeUsers.set(socket.id, { number, username: username.trim() });
-        socket.emit('assigned_credentials', { number, username: username.trim() });
+        activeUsers.set(socket.id, { number, username });
+
+        // ⚡ CRITICAL FIX: rooms are tied to the socket connection, not the user's
+        // number. A reconnect gets a brand-new socket.id that isn't a member of
+        // any Socket.IO room yet, even though the client still thinks it's in
+        // the conversation. Without rejoining here, io.to(roomName).emit(...)
+        // silently stops reaching this user after any disconnect/reconnect.
+        const rooms = userRooms.get(number);
+        if (rooms) {
+            rooms.forEach(roomName => socket.join(roomName));
+        }
+
+        socket.emit('profile_restored_confirm', { number, username });
+        broadcastPresenceToPeers(number, 'online');
     });
 
-    // ⚡ ID PERSISTENCE: Updates username while ensuring the 10-digit ID does not change
     socket.on('update_profile', ({ newUsername }) => {
         const user = activeUsers.get(socket.id);
-        if (user && newUsername && newUsername.trim() !== "") {
-            user.username = newUsername.trim();
-            socket.emit('profile_updated_confirm', { username: user.username });
+        if (user) {
+            user.username = newUsername;
+            socket.emit('profile_updated_confirm', { username: newUsername });
         }
     });
 
     socket.on('delete_profile_data', () => {
-        const currentUser = activeUsers.get(socket.id);
-        
-        if (currentUser) {
-            const userNumber = currentUser.number;
-            
-            for (const roomName of activeChats.keys()) {
-                if (roomName.includes(userNumber)) {
-                    io.to(roomName).emit('peer_profile_deleted', {
-                        roomName,
-                        message: `System Alert: Profile connection closed.`
-                    });
+        const user = activeUsers.get(socket.id);
+        if (user) {
+            const rooms = userRooms.get(user.number);
+            if (rooms) {
+                rooms.forEach(roomName => {
+                    const peerNumber = getPeerNumberInRoom(roomName, user.number);
+                    const peerSocketId = getSocketIdByNumber(peerNumber);
+                    if (peerSocketId) {
+                        io.to(peerSocketId).emit('peer_account_deleted', { peerNumber: user.number });
+                    }
                     activeChats.delete(roomName);
-                }
+                });
             }
+            userRooms.delete(user.number);
         }
-        
         activeUsers.delete(socket.id);
         socket.emit('profile_deleted_confirm');
     });
@@ -94,7 +119,7 @@ io.on('connection', (socket) => {
 
         const peerSocketId = getSocketIdByNumber(peerNumber);
         if (!peerSocketId) {
-            socket.emit('error_message', { message: 'The requested line profile is offline or invalid.' });
+            socket.emit('error_message', { message: 'The requested NOMBER is currently offline or invalid.' });
             return;
         }
 
@@ -103,9 +128,27 @@ io.on('connection', (socket) => {
 
         socket.join(roomName);
         io.sockets.sockets.get(peerSocketId)?.join(roomName);
+        addUserRoom(currentUser.number, roomName);
+        addUserRoom(peerData.number, roomName);
 
         socket.emit('peer_connected', { roomName, peerNumber: peerData.number, peerUsername: peerData.username, initiator: true });
         io.to(peerSocketId).emit('peer_connected', { roomName, peerNumber: currentUser.number, peerUsername: currentUser.username, initiator: false });
+    });
+
+    // ⚡ Presence: relay this user's online/away status to whoever shares a room with them.
+    socket.on('presence_update', ({ status }) => {
+        const user = activeUsers.get(socket.id);
+        if (!user) return;
+        broadcastPresenceToPeers(user.number, status);
+    });
+
+    // Best-effort room cleanup when a user deletes a chat on their end.
+    socket.on('leave_room', ({ roomName }) => {
+        const user = activeUsers.get(socket.id);
+        socket.leave(roomName);
+        if (user) {
+            userRooms.get(user.number)?.delete(roomName);
+        }
     });
 
     socket.on('send_message', ({ roomName, message }) => {
@@ -131,15 +174,16 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         console.log(`User disconnected: ${socket.id}`);
-        activeUsers.delete(socket.id);
+        const user = activeUsers.get(socket.id);
+        if (user) {
+            broadcastPresenceToPeers(user.number, 'offline');
+        }
     });
 });
 
-// Ephemeral Room Expiry Watcher Engine
 setInterval(() => {
     const now = Date.now();
     const THIRTY_MINUTES = 30 * 60 * 1000;
-    
     for (const [roomName, chatData] of activeChats.entries()) {
         if (now - chatData.createdAt > THIRTY_MINUTES) {
             io.to(roomName).emit('chat_expired', { message: 'This ephemeral conversation has expired.' });
@@ -149,4 +193,4 @@ setInterval(() => {
 }, 60000);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 FlashChat Backend Engine live on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Engine live on port ${PORT}`));
