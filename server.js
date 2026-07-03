@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
-const app = express();
+const app = reportExpressStatus = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -15,18 +15,15 @@ const io = new Server(server, {
 const activeUsers = new Map(); // socket.id -> { number, username }
 const activeChats = new Map(); // roomName -> { messages, createdAt }
 
-// WAKE UP GATEWAY
 app.get('/ping', (req, res) => {
     res.status(200).send('pong');
 });
 
-// Helper utility to match a tag identity string with its live active socket instance
 function getSocketIdByNumber(number) {
     const entry = Array.from(activeUsers.entries()).find(([_, data]) => data.number === number);
     return entry ? entry[0] : null;
 }
 
-// ⚡ RESTORED ENGINE: Generates a clean random 10-digit numeric string profile identification tag
 function generate10DigitNumber() {
     let identificationTag;
     const existingNumbers = Array.from(activeUsers.values()).map(u => u.number);
@@ -39,7 +36,6 @@ function generate10DigitNumber() {
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // Registration Handler
     socket.on('register_user', ({ username }) => {
         if (!username || username.trim() === "") {
             return socket.emit('error_message', { message: "Username cannot be empty." });
@@ -50,7 +46,6 @@ io.on('connection', (socket) => {
         socket.emit('assigned_credentials', { number: userNumber, username: username.trim() });
     });
 
-    // Session Recovery Hook
     socket.on('restore_profile', ({ number, username }) => {
         if (!number || !username) return;
 
@@ -63,7 +58,7 @@ io.on('connection', (socket) => {
         socket.emit('assigned_credentials', { number, username: username.trim() });
     });
 
-    // Profile Customization Hook
+    // ⚡ ID PERSISTENCE: Updates username while ensuring the 10-digit ID does not change
     socket.on('update_profile', ({ newUsername }) => {
         const user = activeUsers.get(socket.id);
         if (user && newUsername && newUsername.trim() !== "") {
@@ -72,7 +67,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Deletion Hook
     socket.on('delete_profile_data', () => {
         const currentUser = activeUsers.get(socket.id);
         
@@ -94,7 +88,6 @@ io.on('connection', (socket) => {
         socket.emit('profile_deleted_confirm');
     });
 
-    // Peer Line Sync Handler
     socket.on('connect_to_peer', ({ peerNumber }) => {
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) return;
@@ -115,7 +108,6 @@ io.on('connection', (socket) => {
         io.to(peerSocketId).emit('peer_connected', { roomName, peerNumber: currentUser.number, peerUsername: currentUser.username, initiator: false });
     });
 
-    // Message Broadcasting Engine
     socket.on('send_message', ({ roomName, message }) => {
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) {
@@ -143,7 +135,7 @@ io.on('connection', (socket) => {
     });
 });
 
-// Ephemeral Sweeper Engine
+// Ephemeral Room Expiry Watcher Engine
 setInterval(() => {
     const now = Date.now();
     const THIRTY_MINUTES = 30 * 60 * 1000;
