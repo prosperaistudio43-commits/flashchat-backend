@@ -245,12 +245,13 @@ io.on('connection', (socket) => {
     // 👥 GROUP CHAT EVENTS
     // ==========================================================================
 
-    socket.on('create_group', () => {
+    socket.on('create_group', ({ groupName: requestedGroupName } = {}) => {
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) return;
 
         const groupId = generateGroupId();
-        const groupName = generateGroupName();
+        const trimmedRequestedName = typeof requestedGroupName === 'string' ? requestedGroupName.trim().slice(0, 30) : '';
+        const groupName = trimmedRequestedName.length > 0 ? trimmedRequestedName : generateGroupName();
         const group = {
             groupId,
             groupName,
@@ -293,6 +294,21 @@ io.on('connection', (socket) => {
         addUserGroup(currentUser.number, groupId);
         socket.join(groupId);
 
+        // Push the "in the 4kin chat" system message BEFORE building the
+        // group_joined payload (which references group.messages directly) so
+        // the joiner sees their own presence indicator too, not just the
+        // members already in the room.
+        let joinSystemMsg = null;
+        if (!alreadyMember) {
+            joinSystemMsg = {
+                roomName: groupId,
+                system: true,
+                text: `${currentUser.username} in the 4kin chat`,
+                timestamp: Date.now()
+            };
+            group.messages.push(joinSystemMsg);
+        }
+
         socket.emit('group_joined', {
             groupId,
             groupName: group.groupName,
@@ -301,14 +317,7 @@ io.on('connection', (socket) => {
             messages: group.messages
         });
 
-        if (!alreadyMember) {
-            const joinSystemMsg = {
-                roomName: groupId,
-                system: true,
-                text: `${currentUser.username} in the 4kin chat`,
-                timestamp: Date.now()
-            };
-            group.messages.push(joinSystemMsg);
+        if (joinSystemMsg) {
             socket.to(groupId).emit('group_member_joined', {
                 groupId,
                 number: currentUser.number,
