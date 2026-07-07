@@ -256,6 +256,16 @@ io.on('connection', (socket) => {
         socket.emit('profile_deleted_confirm');
     });
 
+    // Lets a client that just landed on an `?invite=` link ask who sent it,
+    // so the popup can say "Accept invite from <username>" instead of just
+    // showing the raw number. Read-only — doesn't join any rooms or affect
+    // state, so it's safe to fire even before the person decides to accept.
+    socket.on('lookup_number', ({ number }) => {
+        const targetSocketId = getSocketIdByNumber(number);
+        const targetUser = targetSocketId ? activeUsers.get(targetSocketId) : null;
+        socket.emit('number_lookup_result', { number, username: targetUser ? targetUser.username : null });
+    });
+
     socket.on('connect_to_peer', ({ peerNumber }) => {
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) return;
@@ -402,7 +412,7 @@ io.on('connection', (socket) => {
         userRooms.get(user.number)?.delete(roomName);
     });
 
-    socket.on('send_message', ({ roomName, message }) => {
+    socket.on('send_message', ({ roomName, message, id }) => {
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) {
             socket.emit('request_reauth');
@@ -410,6 +420,7 @@ io.on('connection', (socket) => {
         }
 
         const msgData = {
+            id: id || null,
             roomName,
             sender: currentUser.number,
             senderUsername: currentUser.username,
