@@ -330,6 +330,7 @@ io.on('connection', (socket) => {
             groupId,
             groupName,
             createdAt: group.createdAt,
+            expiresAt: group.createdAt + GROUP_LIFETIME_MS,
             members: serializeGroupMembers(group),
             messages: []
         });
@@ -375,6 +376,7 @@ io.on('connection', (socket) => {
             groupId,
             groupName: group.groupName,
             createdAt: group.createdAt,
+            expiresAt: group.createdAt + GROUP_LIFETIME_MS,
             members: serializeGroupMembers(group),
             messages: group.messages
         });
@@ -459,6 +461,23 @@ io.on('connection', (socket) => {
         const peerNumber = getPeerNumberInRoom(roomName, currentUser.number);
         const peerSocketId = getSocketIdByNumber(peerNumber);
         if (peerSocketId) io.sockets.sockets.get(peerSocketId)?.join(roomName);
+
+        // ⚡ FIX ("message looks sent but the other person never gets it"):
+        // userRooms is what decides which rooms get synced back to someone on
+        // their next restore_profile. It used to only get populated inside
+        // connect_to_peer, which requires the peer to be online *at that exact
+        // moment*. If the peer was offline/stale when this message was sent
+        // (long silence, backgrounded app, or the server having restarted and
+        // wiped its in-memory state), connect_to_peer silently failed for them
+        // and this room never got registered under their number — so even
+        // though the message was stored here and the sender's UI showed it as
+        // sent, the peer's next reconnect had no idea this room existed and
+        // could never pick the message up. Registering both sides here,
+        // unconditionally, on every send, guarantees a stored message is
+        // always reachable by both participants, no matter who was online
+        // when it was sent.
+        addUserRoom(currentUser.number, roomName);
+        addUserRoom(peerNumber, roomName);
 
         chatData.lastActivityAt = Date.now();
         chatData.messages.push(msgData);
