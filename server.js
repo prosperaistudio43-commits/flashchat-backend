@@ -9,15 +9,48 @@ const io = new Server(server, {
     cors: {
         origin: "*", 
         methods: ["GET", "POST"]
-    }
+    },
     // NOTE: default maxHttpBufferSize is ~1MB. Avatars and image messages must
     // stay compressed client-side (see compressImageToDataUrl in app.js) or
     // the socket connection for that user gets silently dropped mid-send.
+
+    // ⚡ FIX ("chats don't load / messages don't send after being away for a
+    // while"): Socket.IO's defaults (pingInterval 25s, pingTimeout 20s) mean
+    // a dead connection (phone locked, app backgrounded, wifi↔cell handoff,
+    // etc.) can sit "connected" from the server's point of view for up to
+    // ~45s before it's actually declared dead. On mobile, background timer
+    // throttling regularly stretches the *client's* awareness of this far
+    // past 10 minutes — it thinks it's still connected and silently queues
+    // emits (see app.js) instead of reconnecting. Shortening both values
+    // makes the server notice a dead socket sooner, which is what drives the
+    // client's 'disconnect' → reconnect → resync chain.
+    pingInterval: 20000,
+    pingTimeout: 15000
 });
+
+// Lightweight health/keep-alive endpoint. The client pings this periodically
+// while the app is open and connected (see app.js) purely to help keep a
+// free-tier host (Render, etc.) from spinning down after ~15 minutes of no
+// traffic — that spin-down + cold-start-on-next-request is a common cause of
+// the app being unusably slow to reconnect after someone's been away a while.
+app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 const activeUsers = new Map(); // socket.id -> { number, username, avatar }
 const activeChats = new Map(); // roomName ("num_num") -> { messages, createdAt }
 const userRooms = new Map();   // number -> Set of 1:1 roomNames this user belongs to
+
+// ==========================================================================
+// 🚫 BLOCKING
+// blockedUsers: number -> Set of numbers that this user has blocked. Blocking
+// is one-directional to record (A blocked B, not the other way round), but
+// isBlockedPair() checks both directions so neither side can reach the other
+// once a block exists — no way to work around it just by reconnecting.
+// ==========================================================================
+const blockedUsers = new Map();
+
+function isBlockedPair(numberA, numberB) {
+    return !!(blockedUsers.get(numberA)?.has(numberB) || blockedUsers.get(numberB)?.has(numberA));
+}
 
 // ==========================================================================
 // 👥 GROUP CHAT STATE
@@ -277,6 +310,12 @@ io.on('connection', (socket) => {
         }
 
         const peerData = activeUsers.get(peerSocketId);
+
+        if (isBlockedPair(currentUser.number, peerData.number)) {
+            socket.emit('error_message', { message: 'The requested NOMBER is currently offline or invalid.' });
+            return;
+        }
+
         const roomName = [currentUser.number, peerData.number].sort().join('_');
 
         // Re-joining is always safe/idempotent — this is also what "reconnect
@@ -414,10 +453,53 @@ io.on('connection', (socket) => {
         userRooms.get(user.number)?.delete(roomName);
     });
 
-    socket.on('send_message', ({ roomName, message, id }) => {
+    // ==========================================================================
+    // 🚫 BLOCK USER
+    // Records the block, wipes the 1:1 chat out of server memory for BOTH
+    // participants (not just the blocker's device — a real delete-for-everyone,
+    // unlike the "clears it from your device" behavior of leave_room), and lets
+    // the blocked party know why their chat just vanished.
+    // ==========================================================================
+    socket.on('block_user', ({ roomName, blockedNumber }) => {
+        const user = activeUsers.get(socket.id);
+        if (!user || !roomName || !blockedNumber) return;
+
+        if (!blockedUsers.has(user.number)) blockedUsers.set(user.number, new Set());
+        blockedUsers.get(user.number).add(blockedNumber);
+
+        // Wipe the room server-side so it's gone for both parties, not just
+        // whoever clicked Block — matches "auto delete chat for both parties".
+        activeChats.delete(roomName);
+        userRooms.get(user.number)?.delete(roomName);
+        userRooms.get(blockedNumber)?.delete(roomName);
+        socket.leave(roomName);
+
+        const blockedSocketId = getSocketIdByNumber(blockedNumber);
+        if (blockedSocketId) {
+            io.sockets.sockets.get(blockedSocketId)?.leave(roomName);
+            io.to(blockedSocketId).emit('you_were_blocked', {
+                roomName,
+                byNumber: user.number,
+                byUsername: user.username
+            });
+        }
+    });
+
+    // ⚡ ACK SUPPORT: `ack` is an optional Socket.IO callback the client can
+    // pass as the last argument. Every return path below calls it (when
+    // present) with { ok: true|false }. Without this, "send_message" was
+    // fire-and-forget — the client had no way to distinguish "actually
+    // delivered" from "queued locally by the socket while disconnected and
+    // still waiting to go out", which is what made messages look sent when
+    // they silently weren't (and encouraged people to retype/resend the same
+    // message, causing the "auto repeat" duplicates).
+    socket.on('send_message', ({ roomName, message, id }, ack) => {
+        const respond = (payload) => { if (typeof ack === 'function') ack(payload); };
+
         const currentUser = activeUsers.get(socket.id);
         if (!currentUser) {
             socket.emit('request_reauth');
+            respond({ ok: false, reason: 'not_authenticated' });
             return;
         }
 
@@ -435,15 +517,23 @@ io.on('connection', (socket) => {
         // between group storage/broadcast and the existing 1:1 path below.
         if (groups.has(roomName)) {
             const group = groups.get(roomName);
-            if (!group.members.has(currentUser.number)) return; // not (or no longer) a member
+            if (!group.members.has(currentUser.number)) {
+                respond({ ok: false, reason: 'not_a_member' });
+                return; // not (or no longer) a member
+            }
             // Self-heal: a reconnect can hand this user a brand-new socket.id
             // that never actually re-joined the Socket.IO room (e.g. if
             // restore_profile hasn't landed yet on this exact socket for some
             // reason). Joining is a no-op if already a member, so this is
             // always safe and guarantees this send actually reaches the room.
             socket.join(roomName);
+            if (id && group.messages.some(m => m.id === id)) {
+                respond({ ok: true, id }); // already stored (a retried send whose original ack got lost) — no-op
+                return;
+            }
             group.messages.push(msgData);
             io.to(roomName).emit('receive_message', msgData);
+            respond({ ok: true, id });
             return;
         }
 
@@ -457,8 +547,13 @@ io.on('connection', (socket) => {
         // this socket somehow isn't registered in the Socket.IO room (stale
         // membership after a disconnect/reconnect), re-join before broadcasting
         // instead of silently emitting into a room this socket isn't part of.
-        socket.join(roomName);
         const peerNumber = getPeerNumberInRoom(roomName, currentUser.number);
+        if (isBlockedPair(currentUser.number, peerNumber)) {
+            respond({ ok: false, reason: 'blocked' });
+            return; // silently drop — one side has blocked the other
+        }
+
+        socket.join(roomName);
         const peerSocketId = getSocketIdByNumber(peerNumber);
         if (peerSocketId) io.sockets.sockets.get(peerSocketId)?.join(roomName);
 
@@ -479,13 +574,31 @@ io.on('connection', (socket) => {
         addUserRoom(currentUser.number, roomName);
         addUserRoom(peerNumber, roomName);
 
+        if (id && chatData.messages.some(m => m.id === id)) {
+            respond({ ok: true, id }); // already stored (a retried send whose original ack got lost) — no-op
+            return;
+        }
+
         chatData.lastActivityAt = Date.now();
         chatData.messages.push(msgData);
         io.to(roomName).emit('receive_message', msgData);
+        respond({ ok: true, id });
     });
 
     socket.on('disconnect', () => {
         console.log(`User disconnected: ${socket.id}`);
+
+        // ⚡ FIX: this used to leave the activeUsers entry behind forever.
+        // restore_profile does clean up the *old* entry once a reconnect
+        // happens, but until that reconnect lands, getSocketIdByNumber()
+        // (used by connect_to_peer, update_avatar, delete_profile_data, etc.)
+        // would keep resolving this now-dead socket.id as if the user were
+        // still online — e.g. connect_to_peer would report a stale "online"
+        // peer whose messages were never actually delivered anywhere. Only
+        // remove the entry that belongs to *this* socket.id, which is always
+        // safe: a reconnect always gets a brand-new socket.id, so this can
+        // never accidentally delete a newer, still-live session.
+        activeUsers.delete(socket.id);
     });
 });
 
